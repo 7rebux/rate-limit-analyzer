@@ -1,9 +1,11 @@
+import * as fs from 'fs';
 import "dotenv/config"
+import {rateLimitQueue} from "./rate-limit-queue.js";
 
 const AUTH_TOKEN = process.env.TOKEN
 const SOURCE_IDS = "199226"
 
-const fetchLogs = async (query, count = 100, from = (Date.now() - 1000 * 60 * 60 * 12), to = Date.now()) => {
+const fetchLogs = async (query, count = 100, from, to) => {
   query = encodeURIComponent(query)
   from = new Date(from).toISOString()
   to = new Date(to).toISOString()
@@ -20,64 +22,102 @@ const fetchLogsByUrl = async (url) => {
     }
   )
 
-  return await response.json()
+  const object = await response.json();
+
+  return {
+    ...object, data: object.data.map(log => {
+      let date = parseInt(log._dt);
+
+      //if(date > Date.now() + 24 * 1000 * 60 * 60) {
+      date = Math.trunc(date / 1000);
+      //}
+
+      return {...log, date: date, parsedJson: JSON.parse(log.json)};
+    })
+  };
 }
 
-const fetchAllLogsUntil = async (query, until = Date.now() - 24 * 60 * 60 * 1000) => {
-  const logs = [];
-  let response = null;
+const fetchAllLogsUntil = async (query, from, to = Date.now()) => {
+  return rateLimitQueue.add(async () => {
+    const logs = [];
+    let response = null;
 
-  while (!response || response.data.length > 0) {
-    response = await (response ? fetchLogsByUrl(response.pagination.next) : fetchLogs(query, 1000, until));
+    while (!response || response.data.length > 0) {
+      response = await (response ? fetchLogsByUrl(response.pagination.next) : fetchLogs(query, 1000, from, to));
 
-    logs.push(...response.data.filter(e => Date.parse(e.dt) >= until))
+      logs.push(...response.data.filter(e => e.date >= from))
 
-    if (response.data.find(e => Date.parse(e.dt) < until)) break;
+      if (response.data.find(e => e.date < from)) {
+        break;
+      }
+    }
+
+    return logs;
+  });
+}
+
+async function getAllRateLimitedLogs() {
+  const path = './all-rate-limited.json';
+
+  if (fs.existsSync(path)) {
+    // Read the file
+    console.log("Reading all rate limited logs from existing file!")
+    const fileContent = fs.readFileSync(path, 'utf8');
+    return JSON.parse(fileContent);
+  } else {
+    console.log('File does not exist.');
+    const arrayToWrite = await fetchAllLogsUntil(`message_json.status="429" AND (extensionVersion="2.3.14" OR extensionVersion="2.3.15" OR extensionVersion="2.3.16")`, Date.now() - 24 * 60 * 60 * 1000);
+    fs.writeFileSync(path, JSON.stringify(arrayToWrite));
+    console.log('Written new array to file.');
+    return arrayToWrite;
   }
-
-  return logs;
 }
 
-const getOFRequestsBefore = async (creatorid, dt) => {
-  const startTime = dt - 1000 * 60 * 3
-  const logs = await fetchLogs(`creatorid="${creatorid}" "OF request"`, 1000, startTime, dt)
+const getOFRequestsBefore = async (creatorid, occurrenceDate) => {
+  const startTime = occurrenceDate - 1000 * 60 * 15
+  const logs = await fetchAllLogsUntil(`creatorid="${creatorid}" "OF request"`, startTime, occurrenceDate)
   const data = {}
 
-  for (const {message, extensionVersion} of logs.data) {
+  for (const {message, date: logDate, parsedJson} of logs) {
     const regex = /:\s(\[.*\])\s/g
     const result = regex.exec(message)
-    const service = (result ? result[1] : "NO_SERVICE_SPECIFIED") + "_" + extensionVersion;
+    const service = (result ? result[1] : "NO_SERVICE_SPECIFIED") + "_" + parsedJson.extensionVersion;
+    const array = data[service] ?? [0, 0, 0, 0, 0];
 
-    data[service] = (data[service] ?? 0) + 1
+    // 1, 3, 5, 10, 15
+
+    if (Math.abs(logDate - startTime) < 1000 * 60) array[0] = array[0] + 1
+    if (Math.abs(logDate - startTime) < 1000 * 60 * 3) array[1] = array[1] + 1
+    if (Math.abs(logDate - startTime) < 1000 * 60 * 5) array[2] = array[2] + 1
+    if (Math.abs(logDate - startTime) < 1000 * 60 * 10) array[3] = array[3] + 1
+    if (Math.abs(logDate - startTime) < 1000 * 60 * 15) array[4] = array[4] + 1
+
+    data[service] = array;
   }
 
   return data
 }
 
-const allRateLimitedLogs = await fetchAllLogsUntil(`message_json.status="429" AND (extensionVersion="2.3.13" OR extensionVersion="2.3.14")`);
+const allRateLimitedLogs = await getAllRateLimitedLogs();
 const occurrences = [];
 
 console.log("Found " + allRateLimitedLogs.length + " rate limited requests. Handling occurrences...");
 
-for (const log of allRateLimitedLogs) {
-  const logDate = Date.parse(log.dt);
-  const minDate = logDate - 1000 * 60 * 3;
-  const parsedJson = JSON.parse(log.json);
+let i = 0;
 
-  if (allRateLimitedLogs.filter(e => {
-    const otherDate = Date.parse(e.dt);
-    return otherDate >= minDate && otherDate < logDate;
-  }).find(e => {
-    const otherJson = JSON.parse(e.json);
-    return otherJson.creatorId === parsedJson.creatorId;
-  })) {
+for (const {parsedJson, date} of allRateLimitedLogs) {
+  console.log(`Handling log ${++i}/${allRateLimitedLogs.length}...`)
+
+  const minDate = date - 1000 * 60 * 3;
+
+  if (allRateLimitedLogs.find(e => e.date >= minDate && e.date < date && e.parsedJson.creatorId === parsedJson.creatorId)) {
     continue;
   }
 
   occurrences.push({
     email: parsedJson.email,
     creatorId: parsedJson.creatorId,
-    dt: logDate
+    date
   });
 }
 
@@ -86,28 +126,56 @@ console.log("Found " + occurrences.length + " total occurrences. Now checking al
 // const checked = []
 const result = {};
 
-let i = 0
+i = 0
 
-for (const {email, creatorId, dt} of occurrences) {
-  const creatorData = result[creatorId] ?? {email, creatorId, total: 0, occurrences: []}
+async function getOccurrenceInfo(occurrenceResult) {
+  const {email, creatorId, date} = occurrenceResult;
+  const occurrenceData =
+    Object.entries(await getOFRequestsBefore(creatorId, date))
+      .sort(([aKey, aValue], [bKey, bValue]) => bValue[3] - aValue[3]);
+  const occurrenceDataObject = {};
 
-  const occurrenceData = await getOFRequestsBefore(creatorId, dt);
-  const totalRequests = Object.values(occurrenceData).reduce((a, b) => a + b, 0);
-  creatorData.total = creatorData.total + totalRequests;
-
-  const occurrence = {
-    totalRequests,
-    requests: Object.entries(occurrenceData)
-      .sort(([aKey, aValue], [bKey, bValue]) => bValue - aValue)
-      .map(([key, value]) => `${key}: ${value}`)
-  };
-  creatorData.occurrences.push(occurrence);
-  creatorData.occurrences.sort((a, b) => b.totalRequests - a.totalRequests);
-
-  result[creatorId] = creatorData;
+  for (const [key, value] of occurrenceData) {
+    occurrenceDataObject[key] = value;
+  }
 
   console.log("Handled " + (++i) + "/" + occurrences.length + " occurrences");
+
+  const totalRequests = occurrenceData.map(([key, value]) => value)
+    .reduce((a, b) =>
+      [
+        a[0] + b[0],
+        a[1] + b[1],
+        a[2] + b[2],
+        a[3] + b[3],
+        a[4] + b[4]],
+      [0, 0, 0, 0, 0]
+    );
+  return {
+    totalRequests,
+    creatorId,
+    email,
+    date: new Date(date).toISOString(),
+    requests: occurrenceDataObject
+  };
 }
 
+const allOccurrences = await Promise.all(occurrences.map(getOccurrenceInfo));
+
+for (const occurrence of allOccurrences) {
+  const creatorData = result[occurrence.creatorId] ?? {
+    email: occurrence.email,
+    creatorId: occurrence.creatorId,
+    total: 0,
+    occurrences: []
+  }
+  creatorData.total = creatorData.total + occurrence.totalRequests[4];
+  creatorData.occurrences.push(occurrence);
+  creatorData.occurrences.sort((a, b) => b.totalRequests[4] - a.totalRequests[4]);
+
+  result[occurrence.creatorId] = creatorData;
+}
+
+
 const finalResult = Object.values(result).sort((a, b) => b.total - a.total);
-console.log(JSON.stringify(finalResult))
+console.log(JSON.stringify(finalResult));
