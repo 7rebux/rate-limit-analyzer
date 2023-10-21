@@ -22,7 +22,16 @@ const fetchLogsByUrl = async (url) => {
     }
   )
 
-  const object = await response.json();
+  const text = await response.text();
+  let object;
+
+  try {
+    object = JSON.parse(text);
+  } catch (error) {
+    console.log("Error while parsing json: " + error);
+    console.log("Text: " + text);
+    throw error;
+  }
 
   return {
     ...object, data: object.data.map(log => {
@@ -143,12 +152,12 @@ async function getOccurrenceInfo(occurrenceResult) {
 
   const totalRequests = occurrenceData.map(([key, value]) => value)
     .reduce((a, b) =>
-      [
-        a[0] + b[0],
-        a[1] + b[1],
-        a[2] + b[2],
-        a[3] + b[3],
-        a[4] + b[4]],
+        [
+          a[0] + b[0],
+          a[1] + b[1],
+          a[2] + b[2],
+          a[3] + b[3],
+          a[4] + b[4]],
       [0, 0, 0, 0, 0]
     );
   return {
@@ -178,4 +187,6 @@ for (const occurrence of allOccurrences) {
 
 
 const finalResult = Object.values(result).sort((a, b) => b.total - a.total);
-console.log(JSON.stringify(finalResult));
+
+fs.writeFileSync('output-' + Date.now() + '.json', JSON.stringify(finalResult));
+console.log("Finished and written to file!")
