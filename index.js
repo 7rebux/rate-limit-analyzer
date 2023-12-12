@@ -75,7 +75,7 @@ async function getAllRateLimitedLogs() {
     return JSON.parse(fileContent);
   } else {
     console.log('File does not exist.');
-    const arrayToWrite = await fetchAllLogsUntil(`message_json.status="429" AND (extensionVersion="2.3.14" OR extensionVersion="2.3.15" OR extensionVersion="2.3.16")`, Date.now() - 24 * 60 * 60 * 1000);
+    const arrayToWrite = await fetchAllLogsUntil(`message_json.status="429" AND email=\"Maximilianschulz1@web.de\"`, Date.now() - 24 * 60 * 60 * 1000);
     fs.writeFileSync(path, JSON.stringify(arrayToWrite));
     console.log('Written new array to file.');
     return arrayToWrite;
